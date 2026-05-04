@@ -34,7 +34,6 @@
 #define LIBNNZ_NZPA_SSL_WRITE 0x11b250UL
 #define LIBNNZ_NZOS_READ 0x136750UL
 #define NZOS_READ_SUCCESS_DELTA 0xfcUL
-#define RECENT_PACKETS 32
 
 static volatile sig_atomic_t g_stop;
 
@@ -56,13 +55,6 @@ struct endpoint {
     uint16_t server_port;
 };
 
-struct recent_packet {
-    uint64_t hash;
-    uint32_t len;
-    int server_to_client;
-    enum packet_format fmt;
-};
-
 struct session {
     pid_t first_pid;
     pid_t last_pid;
@@ -75,8 +67,8 @@ struct session {
     uint64_t packets;
     uint64_t bytes;
     time_t last_seen;
-    unsigned int recent_next;
-    struct recent_packet recent[RECENT_PACKETS];
+    unsigned long dedicated_ctx;
+    unsigned long listener_ctx;
     struct endpoint ep;
 };
 
@@ -240,37 +232,6 @@ static const char *packet_format_name(enum packet_format fmt)
     default:
         return "unknown";
     }
-}
-
-static uint64_t fnv1a64(const uint8_t *buf, uint32_t len)
-{
-    uint64_t h = 1469598103934665603ULL;
-    for (uint32_t i = 0; i < len; i++) {
-        h ^= buf[i];
-        h *= 1099511628211ULL;
-    }
-    return h;
-}
-
-static int session_seen_packet(struct session *s, int server_to_client,
-                               enum packet_format fmt, const uint8_t *buf,
-                               uint32_t len)
-{
-    uint64_t hash = fnv1a64(buf, len);
-    for (int i = 0; i < RECENT_PACKETS; i++) {
-        if (s->recent[i].hash == hash &&
-            s->recent[i].len == len &&
-            s->recent[i].server_to_client == server_to_client &&
-            s->recent[i].fmt == fmt)
-            return 1;
-    }
-
-    unsigned int slot = s->recent_next++ % RECENT_PACKETS;
-    s->recent[slot].hash = hash;
-    s->recent[slot].len = len;
-    s->recent[slot].server_to_client = server_to_client;
-    s->recent[slot].fmt = fmt;
-    return 0;
 }
 
 static int write_pcap_header(const char *path)
@@ -528,16 +489,73 @@ static int endpoint_established(const struct endpoint *ep)
     return 0;
 }
 
-static struct session *get_session(struct session *sessions, pid_t pid, int tcps_port)
+static void update_session_ctx(struct session *s, enum capture_source source,
+                               unsigned long ctx)
 {
-    struct endpoint ep;
-    if (endpoint_for_pid(pid, tcps_port, &ep) != 0)
+    if (!ctx)
+        return;
+    if (source == SRC_LISTENER)
+        s->listener_ctx = ctx;
+    else
+        s->dedicated_ctx = ctx;
+}
+
+static struct session *session_by_ctx(struct session *sessions,
+                                      enum capture_source source,
+                                      unsigned long ctx)
+{
+    if (!ctx)
         return NULL;
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (!sessions[i].active)
+            continue;
+        if (source == SRC_LISTENER && sessions[i].listener_ctx == ctx)
+            return &sessions[i];
+        if (source == SRC_DEDICATED && sessions[i].dedicated_ctx == ctx)
+            return &sessions[i];
+    }
+    return NULL;
+}
+
+static struct session *single_active_session_for_pid(struct session *sessions, pid_t pid)
+{
+    struct session *found = NULL;
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (!sessions[i].active || sessions[i].last_pid != pid)
+            continue;
+        if (found)
+            return NULL;
+        found = &sessions[i];
+    }
+    return found;
+}
+
+static struct session *get_session(struct session *sessions, pid_t pid,
+                                   enum capture_source source,
+                                   unsigned long ctx, int tcps_port)
+{
+    struct session *ctx_session = session_by_ctx(sessions, source, ctx);
+    if (ctx_session) {
+        ctx_session->last_pid = pid;
+        ctx_session->last_seen = time(NULL);
+        return ctx_session;
+    }
+
+    struct endpoint ep;
+    if (endpoint_for_pid(pid, tcps_port, &ep) != 0) {
+        struct session *s = single_active_session_for_pid(sessions, pid);
+        if (s) {
+            update_session_ctx(s, source, ctx);
+            s->last_seen = time(NULL);
+        }
+        return s;
+    }
 
     for (int i = 0; i < MAX_SESSIONS; i++) {
         if (sessions[i].active && same_endpoint(&sessions[i].ep, &ep)) {
             sessions[i].last_pid = pid;
             sessions[i].last_seen = time(NULL);
+            update_session_ctx(&sessions[i], source, ctx);
             return &sessions[i];
         }
     }
@@ -552,6 +570,7 @@ static struct session *get_session(struct session *sessions, pid_t pid, int tcps
             sessions[i].ip_id = (uint16_t)pid;
             sessions[i].last_seen = time(NULL);
             sessions[i].ep = ep;
+            update_session_ctx(&sessions[i], source, ctx);
             return &sessions[i];
         }
     }
@@ -648,16 +667,16 @@ static int setup_tracefs(const char *oracle_home,
     remove_probe("read_success");
 
     if (add_probe("srv_write", srv_lib, srv_write_off,
-                  "buf=%si:u64 len=+0(%dx):u32") != 0)
+                  "ctx=%di:u64 buf=%si:u64 len=+0(%dx):u32 b0=+0(%si):u64") != 0)
         return -1;
     if (add_probe("srv_read_success", srv_lib, srv_read_success_off,
-                  "buf=%r14:u64 len=+0(%r12):u32") != 0)
+                  "ctx=-64(%bp):u64 buf=%r14:u64 len=+0(%r12):u32 b0=+0(%r14):u64") != 0)
         return -1;
     if (add_probe("lsnr_write", lsnr_lib, lsnr_write_off,
-                  "buf=%si:u64 len=+0(%dx):u32") != 0)
+                  "ctx=%di:u64 buf=%si:u64 len=+0(%dx):u32 b0=+0(%si):u64") != 0)
         return -1;
     if (add_probe("lsnr_read_success", lsnr_lib, lsnr_read_success_off,
-                  "buf=%r14:u64 len=+0(%r12):u32") != 0)
+                  "ctx=-64(%bp):u64 buf=%r14:u64 len=+0(%r12):u32 b0=+0(%r14):u64") != 0)
         return -1;
 
     write_file(TRACEFS "/trace", "");
@@ -718,7 +737,8 @@ static pid_t parse_comm_pid_from_trace_line(const char *line, char *comm, size_t
 }
 
 static int parse_trace_line(const char *line, pid_t *pid, enum capture_source *source,
-                            int *server_to_client, unsigned long *buf,
+                            int *server_to_client, unsigned long *ctx,
+                            unsigned long *buf, uint64_t *inline_b0,
                             uint32_t *len)
 {
     char comm[64] = {0};
@@ -744,11 +764,15 @@ static int parse_trace_line(const char *line, pid_t *pid, enum capture_source *s
     if (*source == SRC_LISTENER && strcmp(comm, "tnslsnr") != 0)
         return 0;
 
+    const char *cp = strstr(line, "ctx=");
     const char *bp = strstr(line, "buf=");
     const char *lp = strstr(line, "len=");
-    if (!bp || !lp)
+    const char *b0p = strstr(line, "b0=");
+    if (!cp || !bp || !lp || !b0p)
         return 0;
+    *ctx = strtoul(cp + 4, NULL, 0);
     *buf = strtoul(bp + 4, NULL, 0);
+    *inline_b0 = strtoull(b0p + 3, NULL, 0);
     *len = (uint32_t)strtoul(lp + 4, NULL, 0);
     return *buf != 0 && *len >= 5 && *len <= MAX_PACKET_LEN;
 }
@@ -758,30 +782,39 @@ static enum packet_format plausible_packet(const uint8_t *buf, uint32_t len)
     return packet_format(buf, len);
 }
 
+static void u64_to_le_bytes(uint64_t v, uint8_t *out)
+{
+    for (int i = 0; i < 8; i++)
+        out[i] = (uint8_t)(v >> (8 * i));
+}
+
 static int capture_event(int pcap_fd, struct session *sessions, int tcps_port,
                          pid_t pid, enum capture_source source, int server_to_client,
-                         unsigned long buf_addr, uint32_t len)
+                         unsigned long ctx, unsigned long buf_addr, uint64_t inline_b0,
+                         uint32_t len)
 {
     uint8_t *buf = malloc(len);
     if (!buf)
         return 0;
-    ssize_t n = read_mem(pid, buf_addr, buf, len);
+
+    ssize_t n = -1;
+    if (len <= 8) {
+        uint8_t tmp[8];
+        u64_to_le_bytes(inline_b0, tmp);
+        memcpy(buf, tmp, len);
+        n = (ssize_t)len;
+    } else {
+        n = read_mem(pid, buf_addr, buf, len);
+    }
+
     enum packet_format fmt = n == (ssize_t)len ? plausible_packet(buf, len) : PKT_UNKNOWN;
     if (fmt == PKT_UNKNOWN) {
         free(buf);
         return 0;
     }
 
-    struct session *s = get_session(sessions, pid, tcps_port);
+    struct session *s = get_session(sessions, pid, source, ctx, tcps_port);
     if (!s) {
-        free(buf);
-        return 0;
-    }
-    if (session_seen_packet(s, server_to_client, fmt, buf, len)) {
-        fprintf(stderr, "pid=%d source=%s %s len=%u format=%s duplicate=suppressed\n",
-                pid, source == SRC_LISTENER ? "listener" : "dedicated",
-                server_to_client ? "server_to_client" : "client_to_server",
-                len, packet_format_name(fmt));
         free(buf);
         return 0;
     }
@@ -792,10 +825,10 @@ static int capture_event(int pcap_fd, struct session *sessions, int tcps_port,
         s->packets++;
         s->bytes += len;
         s->last_seen = time(NULL);
-        fprintf(stderr, "pid=%d source=%s %s len=%u format=%s packets=%" PRIu64 "\n",
+        fprintf(stderr, "pid=%d source=%s %s len=%u format=%s ctx=0x%lx packets=%" PRIu64 "\n",
                 pid, source == SRC_LISTENER ? "listener" : "dedicated",
                 server_to_client ? "server_to_client" : "client_to_server",
-                len, packet_format_name(fmt), s->packets);
+                len, packet_format_name(fmt), ctx, s->packets);
         free(buf);
         return 1;
     }
@@ -930,11 +963,14 @@ int main(int argc, char **argv)
                 pid_t pid = 0;
                 enum capture_source source = SRC_DEDICATED;
                 int server_to_client = 0;
+                unsigned long ctx = 0;
                 unsigned long buf_addr = 0;
+                uint64_t inline_b0 = 0;
                 uint32_t len = 0;
-                if (parse_trace_line(linebuf, &pid, &source, &server_to_client, &buf_addr, &len)) {
+                if (parse_trace_line(linebuf, &pid, &source, &server_to_client,
+                                     &ctx, &buf_addr, &inline_b0, &len)) {
                     if (capture_event(pcap_fd, sessions, tcps_port, pid, source,
-                                      server_to_client, buf_addr, len))
+                                      server_to_client, ctx, buf_addr, inline_b0, len))
                         captured++;
                 }
                 line_len = 0;

@@ -35,3 +35,5 @@ Plaintext packet buffers begin with a 4-byte big-endian packet length, followed 
 That is true for post-connect `NS32` data frames. Early Oracle Net connect material uses a classic 2-byte TNS length field and packet type at byte 4. The first version rejected these early `TNS16` packets, which caused the output pcap to miss the `DESCRIPTION=(...)` connect data.
 
 The tracefs PoC registers global uprobes so very fast session open/close traffic can be captured without first attaching to a specific PID. It keys synthetic sessions by TCP 4-tuple because early connection material can be observed in `tnslsnr`, while later buffers are observed in the dedicated server process.
+
+The `tnslsnr` path can emit a short TNS `RESEND` packet before the later memory read occurs. Capturing the first 8 payload bytes in the tracefs event preserves that short-lived packet and allows the downstream replay stream to include the second `CONNECT/DESCRIPTION` exchange.

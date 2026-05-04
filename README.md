@@ -93,7 +93,9 @@ The initial `CONNECT`/`DESCRIPTION=(...)` material appears as `TNS16`. Most late
 
 The pcap uses the real local TCP 4-tuple discovered from the Oracle process where possible, but it is not a copy of the original encrypted TLS packets. It is intended for downstream parsing as a plaintext TNS stream.
 
-The synthetic TCP session is keyed by the 4-tuple instead of PID because the early connection material can be observed in `tnslsnr`, while subsequent traffic is observed in the dedicated Oracle server process. Duplicate payloads seen from both paths are suppressed.
+The synthetic TCP session is keyed by the 4-tuple instead of PID because the early connection material can be observed in `tnslsnr`, while subsequent traffic is observed in the dedicated Oracle server process. The repeated `CONNECT/DESCRIPTION` packets after TNS `RESEND` are preserved because they are part of the real startup exchange.
+
+Some early listener buffers are very short-lived. The tool copies the first 8 payload bytes directly in the uprobe event so small packets such as TNS `RESEND` are not lost before `process_vm_readv()` runs.
 
 ## Validation
 
