@@ -41,7 +41,7 @@ NS32:  4-byte big-endian length, packet type at byte 4.
 
 The synthetic session is keyed by TCP 4-tuple instead of PID. This matters because the same network session can surface in `tnslsnr` and later in a dedicated Oracle server process.
 
-The tool also emits ACK-only frames after each synthetic data frame to make the pcap friendlier to TCP-stream reassemblers used by downstream agents.
+The tool does not emit standalone ACK-only frames after each synthetic data frame by default. The data packets already carry coherent ACK numbers, and replay parsers may mishandle zero-payload TCP segments. Use `-A` only for packet-level debugging when extra ACK-only frames are desired.
 
 Short listener responses can disappear before a later `process_vm_readv()` call. The uprobe event therefore includes the first 8 payload bytes inline, which preserves the observed TNS `RESEND` packet:
 

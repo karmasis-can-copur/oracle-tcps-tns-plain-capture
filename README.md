@@ -74,6 +74,8 @@ sudo ./scripts/run_tracefs_capture.sh \
 
 Use `Ctrl+C` to stop. On graceful exit, the tool disables and removes its tracefs uprobes.
 
+By default the synthetic pcap does not emit standalone ACK-only frames after every payload. The data packets themselves carry coherent TCP ACK numbers, and omitting extra ACK-only frames avoids confusing replay parsers that do not fully ignore zero-payload TCP segments. Use `-A` only when you explicitly want those extra ACK-only frames for packet-level debugging.
+
 ## Output
 
 The pcap is synthetic plaintext traffic built from post-decrypt TNS buffers:

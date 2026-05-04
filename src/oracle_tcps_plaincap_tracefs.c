@@ -36,6 +36,7 @@
 #define NZOS_READ_SUCCESS_DELTA 0xfcUL
 
 static volatile sig_atomic_t g_stop;
+static int g_ack_data_frames;
 
 enum capture_source {
     SRC_DEDICATED,
@@ -821,7 +822,8 @@ static int capture_event(int pcap_fd, struct session *sessions, int tcps_port,
 
     write_handshake(pcap_fd, s);
     if (append_tcp_frame(pcap_fd, s, server_to_client, 0x18, buf, len) == 0) {
-        append_tcp_frame(pcap_fd, s, !server_to_client, 0x10, NULL, 0);
+        if (g_ack_data_frames)
+            append_tcp_frame(pcap_fd, s, !server_to_client, 0x10, NULL, 0);
         s->packets++;
         s->bytes += len;
         s->last_seen = time(NULL);
@@ -839,8 +841,9 @@ static int capture_event(int pcap_fd, struct session *sessions, int tcps_port,
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "Usage: %s [-H ORACLE_HOME] [-p TCPS_PORT] [-o OUT_PCAP] [-n MAX_PACKETS]\n"
-            "Defaults: ORACLE_HOME=%s, TCPS_PORT=%d, OUT_PCAP=%s, MAX_PACKETS=0 unlimited\n",
+            "Usage: %s [-H ORACLE_HOME] [-p TCPS_PORT] [-o OUT_PCAP] [-n MAX_PACKETS] [-A]\n"
+            "Defaults: ORACLE_HOME=%s, TCPS_PORT=%d, OUT_PCAP=%s, MAX_PACKETS=0 unlimited\n"
+            "  -A  emit synthetic ACK-only frames after each data frame\n",
             argv0, DEFAULT_ORACLE_HOME, DEFAULT_PORT, DEFAULT_OUT);
 }
 
@@ -854,7 +857,7 @@ int main(int argc, char **argv)
     uint64_t max_packets = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "H:p:o:n:h")) != -1) {
+    while ((opt = getopt(argc, argv, "H:p:o:n:Ah")) != -1) {
         switch (opt) {
         case 'H':
             oracle_home = optarg;
@@ -867,6 +870,9 @@ int main(int argc, char **argv)
             break;
         case 'n':
             max_packets = strtoull(optarg, NULL, 10);
+            break;
+        case 'A':
+            g_ack_data_frames = 1;
             break;
         case 'h':
         default:
@@ -924,7 +930,8 @@ int main(int argc, char **argv)
             "oracle_home=%s tcps_port=%d out=%s srv_write=0x%lx srv_read_success=0x%lx lsnr_write=0x%lx lsnr_read_success=0x%lx\n",
             oracle_home, tcps_port, out_pcap, srv_write_off, srv_read_success_off,
             lsnr_write_off, lsnr_read_success_off);
-    fprintf(stderr, "capturing globally; start fast TCPS sessions now. Ctrl+C to stop.\n");
+    fprintf(stderr, "capturing globally; data_ack_frames=%s. Ctrl+C to stop.\n",
+            g_ack_data_frames ? "on" : "off");
 
     struct session *sessions = calloc(MAX_SESSIONS, sizeof(*sessions));
     if (!sessions) {
