@@ -25,8 +25,29 @@
 #define TRACEFS "/sys/kernel/tracing"
 #define MAX_SESSIONS 4096
 #define MAX_PACKET_LEN 262144U
+#define TCP_ESTABLISHED 1
+
+#define LIBNNZSRV "libnnzsrv.so"
+#define LIBNNZ "libnnz.so"
+#define LIBNNZSRV_NZPA_SSL_WRITE 0x11c570UL
+#define LIBNNZSRV_NZOS_READ 0x137a70UL
+#define LIBNNZ_NZPA_SSL_WRITE 0x11b250UL
+#define LIBNNZ_NZOS_READ 0x136750UL
+#define NZOS_READ_SUCCESS_DELTA 0xfcUL
+#define RECENT_PACKETS 32
 
 static volatile sig_atomic_t g_stop;
+
+enum capture_source {
+    SRC_DEDICATED,
+    SRC_LISTENER
+};
+
+enum packet_format {
+    PKT_UNKNOWN,
+    PKT_TNS16,
+    PKT_NS32
+};
 
 struct endpoint {
     uint32_t client_ip;
@@ -35,8 +56,16 @@ struct endpoint {
     uint16_t server_port;
 };
 
+struct recent_packet {
+    uint64_t hash;
+    uint32_t len;
+    int server_to_client;
+    enum packet_format fmt;
+};
+
 struct session {
-    pid_t pid;
+    pid_t first_pid;
+    pid_t last_pid;
     int active;
     int handshake_written;
     int fin_written;
@@ -45,6 +74,9 @@ struct session {
     uint16_t ip_id;
     uint64_t packets;
     uint64_t bytes;
+    time_t last_seen;
+    unsigned int recent_next;
+    struct recent_packet recent[RECENT_PACKETS];
     struct endpoint ep;
 };
 
@@ -153,6 +185,92 @@ static void put32(uint8_t *p, uint32_t v)
     p[1] = (uint8_t)(v >> 16);
     p[2] = (uint8_t)(v >> 8);
     p[3] = (uint8_t)v;
+}
+
+static uint16_t be16(const uint8_t *p)
+{
+    return ((uint16_t)p[0] << 8) | p[1];
+}
+
+static uint32_t be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | p[3];
+}
+
+static int valid_tns_type(uint8_t type)
+{
+    switch (type) {
+    case 1:  /* CONNECT */
+    case 2:  /* ACCEPT */
+    case 3:  /* ACK */
+    case 4:  /* REFUSE */
+    case 5:  /* REDIRECT */
+    case 6:  /* DATA */
+    case 7:  /* NULL */
+    case 9:  /* ABORT */
+    case 11: /* RESEND */
+    case 12: /* MARKER */
+    case 13: /* ATTENTION */
+    case 14: /* CONTROL */
+    case 15:
+    case 16:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static enum packet_format packet_format(const uint8_t *buf, uint32_t len)
+{
+    if (len >= 8 && be16(buf) == len && valid_tns_type(buf[4]))
+        return PKT_TNS16;
+    if (len >= 5 && be32(buf) == len && valid_tns_type(buf[4]))
+        return PKT_NS32;
+    return PKT_UNKNOWN;
+}
+
+static const char *packet_format_name(enum packet_format fmt)
+{
+    switch (fmt) {
+    case PKT_TNS16:
+        return "tns16";
+    case PKT_NS32:
+        return "ns32";
+    default:
+        return "unknown";
+    }
+}
+
+static uint64_t fnv1a64(const uint8_t *buf, uint32_t len)
+{
+    uint64_t h = 1469598103934665603ULL;
+    for (uint32_t i = 0; i < len; i++) {
+        h ^= buf[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static int session_seen_packet(struct session *s, int server_to_client,
+                               enum packet_format fmt, const uint8_t *buf,
+                               uint32_t len)
+{
+    uint64_t hash = fnv1a64(buf, len);
+    for (int i = 0; i < RECENT_PACKETS; i++) {
+        if (s->recent[i].hash == hash &&
+            s->recent[i].len == len &&
+            s->recent[i].server_to_client == server_to_client &&
+            s->recent[i].fmt == fmt)
+            return 1;
+    }
+
+    unsigned int slot = s->recent_next++ % RECENT_PACKETS;
+    s->recent[slot].hash = hash;
+    s->recent[slot].len = len;
+    s->recent[slot].server_to_client = server_to_client;
+    s->recent[slot].fmt = fmt;
+    return 0;
 }
 
 static int write_pcap_header(const char *path)
@@ -290,6 +408,7 @@ struct tcp_entry {
     uint32_t rip;
     uint16_t lport;
     uint16_t rport;
+    uint8_t state;
 };
 
 static int parse_tcp4(struct tcp_entry *entries, int max_entries)
@@ -318,11 +437,33 @@ static int parse_tcp4(struct tcp_entry *entries, int max_entries)
         entries[count].lport = (uint16_t)strtoul(colon + 1, NULL, 16);
         entries[count].rip = (uint32_t)strtoul(tok[2], NULL, 16);
         entries[count].rport = (uint16_t)strtoul(rcolon + 1, NULL, 16);
+        entries[count].state = (uint8_t)strtoul(tok[3], NULL, 16);
         entries[count].inode = strtoul(tok[9], NULL, 10);
         count++;
     }
     fclose(fp);
     return count;
+}
+
+static int tcp_entry_to_endpoint(const struct tcp_entry *e, int tcps_port, struct endpoint *ep)
+{
+    if (e->state != TCP_ESTABLISHED || e->rip == 0 || e->rport == 0)
+        return -1;
+    if (e->lport == (uint16_t)tcps_port) {
+        ep->server_ip = e->lip;
+        ep->server_port = e->lport;
+        ep->client_ip = e->rip;
+        ep->client_port = e->rport;
+        return 0;
+    }
+    if (e->rport == (uint16_t)tcps_port) {
+        ep->server_ip = e->rip;
+        ep->server_port = e->rport;
+        ep->client_ip = e->lip;
+        ep->client_port = e->lport;
+        return 0;
+    }
+    return -1;
 }
 
 static int endpoint_for_pid(pid_t pid, int tcps_port, struct endpoint *ep)
@@ -356,19 +497,7 @@ static int endpoint_for_pid(pid_t pid, int tcps_port, struct endpoint *ep)
         for (int i = 0; i < nentries; i++) {
             if (entries[i].inode != inode)
                 continue;
-            if (entries[i].lport == (uint16_t)tcps_port) {
-                ep->server_ip = entries[i].lip;
-                ep->server_port = entries[i].lport;
-                ep->client_ip = entries[i].rip;
-                ep->client_port = entries[i].rport;
-                found = 0;
-                break;
-            }
-            if (entries[i].rport == (uint16_t)tcps_port) {
-                ep->server_ip = entries[i].rip;
-                ep->server_port = entries[i].rport;
-                ep->client_ip = entries[i].lip;
-                ep->client_port = entries[i].lport;
+            if (tcp_entry_to_endpoint(&entries[i], tcps_port, ep) == 0) {
                 found = 0;
                 break;
             }
@@ -378,54 +507,76 @@ static int endpoint_for_pid(pid_t pid, int tcps_port, struct endpoint *ep)
     return found;
 }
 
+static int same_endpoint(const struct endpoint *a, const struct endpoint *b)
+{
+    return a->client_ip == b->client_ip &&
+           a->server_ip == b->server_ip &&
+           a->client_port == b->client_port &&
+           a->server_port == b->server_port;
+}
+
+static int endpoint_established(const struct endpoint *ep)
+{
+    struct tcp_entry entries[8192];
+    int nentries = parse_tcp4(entries, 8192);
+    for (int i = 0; i < nentries; i++) {
+        struct endpoint cur;
+        if (tcp_entry_to_endpoint(&entries[i], ep->server_port, &cur) == 0 &&
+            same_endpoint(ep, &cur))
+            return 1;
+    }
+    return 0;
+}
+
 static struct session *get_session(struct session *sessions, pid_t pid, int tcps_port)
 {
+    struct endpoint ep;
+    if (endpoint_for_pid(pid, tcps_port, &ep) != 0)
+        return NULL;
+
     for (int i = 0; i < MAX_SESSIONS; i++) {
-        if (sessions[i].active && sessions[i].pid == pid)
+        if (sessions[i].active && same_endpoint(&sessions[i].ep, &ep)) {
+            sessions[i].last_pid = pid;
+            sessions[i].last_seen = time(NULL);
             return &sessions[i];
+        }
     }
     for (int i = 0; i < MAX_SESSIONS; i++) {
         if (!sessions[i].active) {
             memset(&sessions[i], 0, sizeof(sessions[i]));
-            sessions[i].pid = pid;
+            sessions[i].first_pid = pid;
+            sessions[i].last_pid = pid;
             sessions[i].active = 1;
             sessions[i].seq_cli = 1000 + (uint32_t)pid;
             sessions[i].seq_srv = 500000 + (uint32_t)pid;
             sessions[i].ip_id = (uint16_t)pid;
-            if (endpoint_for_pid(pid, tcps_port, &sessions[i].ep) != 0) {
-                sessions[i].active = 0;
-                return NULL;
-            }
+            sessions[i].last_seen = time(NULL);
+            sessions[i].ep = ep;
             return &sessions[i];
         }
     }
     return NULL;
 }
 
-static int pid_exists(pid_t pid)
-{
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d", pid);
-    return access(path, F_OK) == 0;
-}
-
-static void close_dead_sessions(int pcap_fd, struct session *sessions)
+static void close_inactive_sessions(int pcap_fd, struct session *sessions)
 {
     for (int i = 0; i < MAX_SESSIONS; i++) {
-        if (sessions[i].active && !pid_exists(sessions[i].pid))
+        if (sessions[i].active && !endpoint_established(&sessions[i].ep))
             write_fin(pcap_fd, &sessions[i]);
     }
 }
 
-static int symbol_offset(const char *oracle_home, const char *symbol, unsigned long *off)
+static int symbol_offset(const char *oracle_home, const char *libname,
+                         const char *symbol, unsigned long fallback,
+                         unsigned long *off)
 {
     char cmd[PATH_MAX + 128];
     const char *modes[] = {
-        "nm -D --defined-only '%s/lib/libnnzsrv.so' 2>/dev/null",
-        "nm '%s/lib/libnnzsrv.so' 2>/dev/null"
+        "nm -D --defined-only '%s/lib/%s' 2>/dev/null",
+        "nm '%s/lib/%s' 2>/dev/null"
     };
     for (size_t m = 0; m < sizeof(modes) / sizeof(modes[0]); m++) {
-        snprintf(cmd, sizeof(cmd), modes[m], oracle_home);
+        snprintf(cmd, sizeof(cmd), modes[m], oracle_home, libname);
         FILE *fp = popen(cmd, "r");
         if (!fp)
             continue;
@@ -442,57 +593,96 @@ static int symbol_offset(const char *oracle_home, const char *symbol, unsigned l
         }
         pclose(fp);
     }
-    if (strcmp(symbol, "nzpa_ssl_Write") == 0) {
-        *off = 0x11c570;
-        return 0;
-    }
-    if (strcmp(symbol, "nzos_Read") == 0) {
-        *off = 0x137a70;
+    if (fallback) {
+        *off = fallback;
         return 0;
     }
     return -1;
 }
 
-static int setup_tracefs(const char *oracle_home, unsigned long write_off, unsigned long read_success_off)
+static void remove_probe(const char *event)
 {
-    char lib[PATH_MAX];
+    char path[PATH_MAX];
+    char line[128];
+
+    snprintf(path, sizeof(path), TRACEFS "/events/ora_plain/%s/enable", event);
+    if (access(path, F_OK) == 0)
+        write_file(path, "0");
+
+    snprintf(line, sizeof(line), "-:ora_plain/%s\n", event);
+    append_file(TRACEFS "/uprobe_events", line);
+}
+
+static int add_probe(const char *event, const char *lib, unsigned long off,
+                     const char *args)
+{
     char line[PATH_MAX + 256];
-    snprintf(lib, sizeof(lib), "%s/lib/libnnzsrv.so", oracle_home);
+    snprintf(line, sizeof(line), "p:ora_plain/%s %s:0x%lx %s\n",
+             event, lib, off, args);
+    return append_file(TRACEFS "/uprobe_events", line);
+}
 
-    write_file(TRACEFS "/events/ora_plain/write/enable", "0");
-    write_file(TRACEFS "/events/ora_plain/read_success/enable", "0");
-    append_file(TRACEFS "/uprobe_events", "-:ora_plain/write\n");
-    append_file(TRACEFS "/uprobe_events", "-:ora_plain/read_success\n");
+static int enable_probe(const char *event)
+{
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), TRACEFS "/events/ora_plain/%s/enable", event);
+    return write_file(path, "1");
+}
 
-    snprintf(line, sizeof(line),
-             "p:ora_plain/write %s:0x%lx buf=%%si:u64 len=+0(%%dx):u32\n",
-             lib, write_off);
-    if (append_file(TRACEFS "/uprobe_events", line) != 0)
+static int setup_tracefs(const char *oracle_home,
+                         unsigned long srv_write_off,
+                         unsigned long srv_read_success_off,
+                         unsigned long lsnr_write_off,
+                         unsigned long lsnr_read_success_off)
+{
+    char srv_lib[PATH_MAX];
+    char lsnr_lib[PATH_MAX];
+    snprintf(srv_lib, sizeof(srv_lib), "%s/lib/%s", oracle_home, LIBNNZSRV);
+    snprintf(lsnr_lib, sizeof(lsnr_lib), "%s/lib/%s", oracle_home, LIBNNZ);
+
+    remove_probe("srv_write");
+    remove_probe("srv_read_success");
+    remove_probe("lsnr_write");
+    remove_probe("lsnr_read_success");
+    remove_probe("write");
+    remove_probe("read_success");
+
+    if (add_probe("srv_write", srv_lib, srv_write_off,
+                  "buf=%si:u64 len=+0(%dx):u32") != 0)
         return -1;
-
-    snprintf(line, sizeof(line),
-             "p:ora_plain/read_success %s:0x%lx buf=%%r14:u64 len=+0(%%r12):u32\n",
-             lib, read_success_off);
-    if (append_file(TRACEFS "/uprobe_events", line) != 0)
+    if (add_probe("srv_read_success", srv_lib, srv_read_success_off,
+                  "buf=%r14:u64 len=+0(%r12):u32") != 0)
+        return -1;
+    if (add_probe("lsnr_write", lsnr_lib, lsnr_write_off,
+                  "buf=%si:u64 len=+0(%dx):u32") != 0)
+        return -1;
+    if (add_probe("lsnr_read_success", lsnr_lib, lsnr_read_success_off,
+                  "buf=%r14:u64 len=+0(%r12):u32") != 0)
         return -1;
 
     write_file(TRACEFS "/trace", "");
-    if (write_file(TRACEFS "/events/ora_plain/write/enable", "1") != 0)
+    if (enable_probe("srv_write") != 0)
         return -1;
-    if (write_file(TRACEFS "/events/ora_plain/read_success/enable", "1") != 0)
+    if (enable_probe("srv_read_success") != 0)
+        return -1;
+    if (enable_probe("lsnr_write") != 0)
+        return -1;
+    if (enable_probe("lsnr_read_success") != 0)
         return -1;
     return 0;
 }
 
 static void cleanup_tracefs(void)
 {
-    write_file(TRACEFS "/events/ora_plain/write/enable", "0");
-    write_file(TRACEFS "/events/ora_plain/read_success/enable", "0");
-    append_file(TRACEFS "/uprobe_events", "-:ora_plain/write\n");
-    append_file(TRACEFS "/uprobe_events", "-:ora_plain/read_success\n");
+    remove_probe("srv_write");
+    remove_probe("srv_read_success");
+    remove_probe("lsnr_write");
+    remove_probe("lsnr_read_success");
+    remove_probe("write");
+    remove_probe("read_success");
 }
 
-static pid_t parse_pid_from_trace_line(const char *line)
+static pid_t parse_comm_pid_from_trace_line(const char *line, char *comm, size_t comm_len)
 {
     const char *br = strchr(line, '[');
     if (!br)
@@ -511,21 +701,47 @@ static pid_t parse_pid_from_trace_line(const char *line)
         return -1;
     memcpy(tmp, p, n);
     tmp[n] = 0;
+    if (comm && comm_len) {
+        const char *cs = line;
+        while (cs < p - 1 && isspace((unsigned char)*cs))
+            cs++;
+        const char *ce = p - 1;
+        while (ce > cs && isspace((unsigned char)ce[-1]))
+            ce--;
+        size_t cn = (size_t)(ce - cs);
+        if (cn >= comm_len)
+            cn = comm_len - 1;
+        memcpy(comm, cs, cn);
+        comm[cn] = 0;
+    }
     return (pid_t)strtol(tmp, NULL, 10);
 }
 
-static int parse_trace_line(const char *line, pid_t *pid, int *server_to_client,
-                            unsigned long *buf, uint32_t *len)
+static int parse_trace_line(const char *line, pid_t *pid, enum capture_source *source,
+                            int *server_to_client, unsigned long *buf,
+                            uint32_t *len)
 {
-    if (strstr(line, ": write:"))
+    char comm[64] = {0};
+    if (strstr(line, ": srv_write:")) {
+        *source = SRC_DEDICATED;
         *server_to_client = 1;
-    else if (strstr(line, ": read_success:"))
+    } else if (strstr(line, ": srv_read_success:")) {
+        *source = SRC_DEDICATED;
         *server_to_client = 0;
-    else
+    } else if (strstr(line, ": lsnr_write:")) {
+        *source = SRC_LISTENER;
+        *server_to_client = 1;
+    } else if (strstr(line, ": lsnr_read_success:")) {
+        *source = SRC_LISTENER;
+        *server_to_client = 0;
+    } else {
         return 0;
+    }
 
-    *pid = parse_pid_from_trace_line(line);
+    *pid = parse_comm_pid_from_trace_line(line, comm, sizeof(comm));
     if (*pid <= 0)
+        return 0;
+    if (*source == SRC_LISTENER && strcmp(comm, "tnslsnr") != 0)
         return 0;
 
     const char *bp = strstr(line, "buf=");
@@ -534,26 +750,24 @@ static int parse_trace_line(const char *line, pid_t *pid, int *server_to_client,
         return 0;
     *buf = strtoul(bp + 4, NULL, 0);
     *len = (uint32_t)strtoul(lp + 4, NULL, 0);
-    return *buf != 0 && *len >= 8 && *len <= MAX_PACKET_LEN;
+    return *buf != 0 && *len >= 5 && *len <= MAX_PACKET_LEN;
 }
 
-static int plausible_packet(const uint8_t *buf, uint32_t len)
+static enum packet_format plausible_packet(const uint8_t *buf, uint32_t len)
 {
-    if (len < 8)
-        return 0;
-    uint32_t be_len = ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) |
-                      ((uint32_t)buf[2] << 8) | buf[3];
-    return be_len == len;
+    return packet_format(buf, len);
 }
 
 static int capture_event(int pcap_fd, struct session *sessions, int tcps_port,
-                         pid_t pid, int server_to_client, unsigned long buf_addr, uint32_t len)
+                         pid_t pid, enum capture_source source, int server_to_client,
+                         unsigned long buf_addr, uint32_t len)
 {
     uint8_t *buf = malloc(len);
     if (!buf)
         return 0;
     ssize_t n = read_mem(pid, buf_addr, buf, len);
-    if (n != (ssize_t)len || !plausible_packet(buf, len)) {
+    enum packet_format fmt = n == (ssize_t)len ? plausible_packet(buf, len) : PKT_UNKNOWN;
+    if (fmt == PKT_UNKNOWN) {
         free(buf);
         return 0;
     }
@@ -563,16 +777,30 @@ static int capture_event(int pcap_fd, struct session *sessions, int tcps_port,
         free(buf);
         return 0;
     }
+    if (session_seen_packet(s, server_to_client, fmt, buf, len)) {
+        fprintf(stderr, "pid=%d source=%s %s len=%u format=%s duplicate=suppressed\n",
+                pid, source == SRC_LISTENER ? "listener" : "dedicated",
+                server_to_client ? "server_to_client" : "client_to_server",
+                len, packet_format_name(fmt));
+        free(buf);
+        return 0;
+    }
+
     write_handshake(pcap_fd, s);
     if (append_tcp_frame(pcap_fd, s, server_to_client, 0x18, buf, len) == 0) {
+        append_tcp_frame(pcap_fd, s, !server_to_client, 0x10, NULL, 0);
         s->packets++;
         s->bytes += len;
-        fprintf(stderr, "pid=%d %s len=%u packets=%" PRIu64 "\n",
-                pid, server_to_client ? "server_to_client" : "client_to_server",
-                len, s->packets);
+        s->last_seen = time(NULL);
+        fprintf(stderr, "pid=%d source=%s %s len=%u format=%s packets=%" PRIu64 "\n",
+                pid, source == SRC_LISTENER ? "listener" : "dedicated",
+                server_to_client ? "server_to_client" : "client_to_server",
+                len, packet_format_name(fmt), s->packets);
+        free(buf);
+        return 1;
     }
     free(buf);
-    return 1;
+    return 0;
 }
 
 static void usage(const char *argv0)
@@ -617,20 +845,29 @@ int main(int argc, char **argv)
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    unsigned long write_off = 0, nzos_read_off = 0;
-    if (symbol_offset(oracle_home, "nzpa_ssl_Write", &write_off) != 0 ||
-        symbol_offset(oracle_home, "nzos_Read", &nzos_read_off) != 0) {
-        fprintf(stderr, "Could not resolve required symbols from %s/lib/libnnzsrv.so\n", oracle_home);
+    unsigned long srv_write_off = 0, srv_nzos_read_off = 0;
+    unsigned long lsnr_write_off = 0, lsnr_nzos_read_off = 0;
+    if (symbol_offset(oracle_home, LIBNNZSRV, "nzpa_ssl_Write",
+                      LIBNNZSRV_NZPA_SSL_WRITE, &srv_write_off) != 0 ||
+        symbol_offset(oracle_home, LIBNNZSRV, "nzos_Read",
+                      LIBNNZSRV_NZOS_READ, &srv_nzos_read_off) != 0 ||
+        symbol_offset(oracle_home, LIBNNZ, "nzpa_ssl_Write",
+                      LIBNNZ_NZPA_SSL_WRITE, &lsnr_write_off) != 0 ||
+        symbol_offset(oracle_home, LIBNNZ, "nzos_Read",
+                      LIBNNZ_NZOS_READ, &lsnr_nzos_read_off) != 0) {
+        fprintf(stderr, "Could not resolve required symbols from %s/lib\n", oracle_home);
         return 1;
     }
-    unsigned long read_success_off = nzos_read_off + 0xfc;
+    unsigned long srv_read_success_off = srv_nzos_read_off + NZOS_READ_SUCCESS_DELTA;
+    unsigned long lsnr_read_success_off = lsnr_nzos_read_off + NZOS_READ_SUCCESS_DELTA;
 
     if (write_pcap_header(out_pcap) != 0) {
         fprintf(stderr, "Could not create %s: %s\n", out_pcap, strerror(errno));
         return 1;
     }
 
-    if (setup_tracefs(oracle_home, write_off, read_success_off) != 0) {
+    if (setup_tracefs(oracle_home, srv_write_off, srv_read_success_off,
+                      lsnr_write_off, lsnr_read_success_off) != 0) {
         fprintf(stderr, "Could not set up tracefs uprobes. Are you root, and is tracefs writable?\n");
         cleanup_tracefs();
         return 1;
@@ -650,8 +887,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    fprintf(stderr, "oracle_home=%s tcps_port=%d out=%s write_off=0x%lx read_success_off=0x%lx\n",
-            oracle_home, tcps_port, out_pcap, write_off, read_success_off);
+    fprintf(stderr,
+            "oracle_home=%s tcps_port=%d out=%s srv_write=0x%lx srv_read_success=0x%lx lsnr_write=0x%lx lsnr_read_success=0x%lx\n",
+            oracle_home, tcps_port, out_pcap, srv_write_off, srv_read_success_off,
+            lsnr_write_off, lsnr_read_success_off);
     fprintf(stderr, "capturing globally; start fast TCPS sessions now. Ctrl+C to stop.\n");
 
     struct session *sessions = calloc(MAX_SESSIONS, sizeof(*sessions));
@@ -676,7 +915,7 @@ int main(int argc, char **argv)
             break;
         }
         if (prc == 0) {
-            close_dead_sessions(pcap_fd, sessions);
+            close_inactive_sessions(pcap_fd, sessions);
             continue;
         }
         ssize_t n = read(trace_fd, readbuf, sizeof(readbuf));
@@ -689,11 +928,13 @@ int main(int argc, char **argv)
             if (readbuf[i] == '\n') {
                 linebuf[line_len] = 0;
                 pid_t pid = 0;
+                enum capture_source source = SRC_DEDICATED;
                 int server_to_client = 0;
                 unsigned long buf_addr = 0;
                 uint32_t len = 0;
-                if (parse_trace_line(linebuf, &pid, &server_to_client, &buf_addr, &len)) {
-                    if (capture_event(pcap_fd, sessions, tcps_port, pid, server_to_client, buf_addr, len))
+                if (parse_trace_line(linebuf, &pid, &source, &server_to_client, &buf_addr, &len)) {
+                    if (capture_event(pcap_fd, sessions, tcps_port, pid, source,
+                                      server_to_client, buf_addr, len))
                         captured++;
                 }
                 line_len = 0;

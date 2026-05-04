@@ -32,4 +32,6 @@ nzos_Read success path at nzos_Read + 0xfc:
 
 Plaintext packet buffers begin with a 4-byte big-endian packet length, followed by Oracle Net/TNS packet bytes.
 
-The tracefs PoC registers global uprobes so very fast session open/close traffic can be captured without first attaching to a specific PID.
+That is true for post-connect `NS32` data frames. Early Oracle Net connect material uses a classic 2-byte TNS length field and packet type at byte 4. The first version rejected these early `TNS16` packets, which caused the output pcap to miss the `DESCRIPTION=(...)` connect data.
+
+The tracefs PoC registers global uprobes so very fast session open/close traffic can be captured without first attaching to a specific PID. It keys synthetic sessions by TCP 4-tuple because early connection material can be observed in `tnslsnr`, while later buffers are observed in the dedicated server process.
