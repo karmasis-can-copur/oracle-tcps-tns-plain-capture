@@ -1,0 +1,26 @@
+# Build outputs
+/build/
+*.o
+*.so
+*.a
+*.exe
+
+# Captures and traces
+*.pcap
+*.pcapng
+*.data
+*.bin
+oracle_plain_packets/
+
+# Local lab material
+remote_*.sh
+*_known_hosts.tmp
+plink.exe
+pscp.exe
+tools/
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
