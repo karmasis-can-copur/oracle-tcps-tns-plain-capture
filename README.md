@@ -14,6 +14,14 @@ src/oracle_tcps_plaincap_tracefs.c
 
 It uses tracefs uprobes against Oracle `libnnzsrv.so` and `libnnz.so` and writes a synthetic plaintext pcap containing the post-decrypt Oracle Net/TNS buffers.
 
+This branch also contains an eBPF-only uprobe variant:
+
+```text
+src/oracle_tcps_plaincap_ebpf.c
+```
+
+The eBPF program is intentionally small. It emits only event metadata (`pid`, `comm`, source/direction, Oracle context pointer, payload pointer, length, first 8 bytes). Payload reads, TNS packet validation, listener-to-dedicated session stitching, and pcap writing all stay in user space. It does not create tracefs probes.
+
 Validated on the lab Oracle 26ai Free-style home:
 
 ```text
@@ -50,6 +58,7 @@ This produces:
 
 ```text
 build/oracle_tcps_plaincap_tracefs
+build/oracle_tcps_plaincap_ebpf
 ```
 
 ## Run
@@ -72,7 +81,16 @@ sudo ./scripts/run_tracefs_capture.sh \
   -o /tmp/oracle_plain_tcps.pcap
 ```
 
-Use `Ctrl+C` to stop. On graceful exit, the tool disables and removes its tracefs uprobes.
+For the eBPF variant:
+
+```bash
+sudo ./scripts/run_ebpf_capture.sh \
+  -H /opt/oracle/product/26ai/dbhomeFree \
+  -p 2484 \
+  -o /tmp/oracle_plain_tcps.pcap
+```
+
+Use `Ctrl+C` to stop. On graceful exit, the tracefs tool disables and removes its tracefs uprobes. The eBPF tool detaches by closing its perf-event uprobe file descriptors and does not create tracefs events.
 
 By default the synthetic pcap does not emit standalone ACK-only frames after every payload. The data packets themselves carry coherent TCP ACK numbers, and omitting extra ACK-only frames avoids confusing replay parsers that do not fully ignore zero-payload TCP segments. Use `-A` only when you explicitly want those extra ACK-only frames for packet-level debugging.
 
@@ -138,6 +156,7 @@ echo '-:ora_plain/lsnr_read_success' >> /sys/kernel/tracing/uprobe_events 2>/dev
 
 ```text
 src/oracle_tcps_plaincap_tracefs.c  Main tracefs global uprobe capturer.
+src/oracle_tcps_plaincap_ebpf.c     eBPF uprobe capturer with user-space packet/session logic.
 src/oracle_tcps_plaincap_ptrace.c   Older ptrace capturer, useful for persistent sessions.
 src/nzpa_ptrace_dump.c              Discovery helper for buffer inspection.
 src/oracle_plain_poll.c             Early polling helper.
